@@ -12,7 +12,6 @@ import {
 } from 'playwright'
 import path from 'path'
 
-let page: Page
 let browser: Browser
 let context: BrowserContext
 let contextHasJSEnabled: boolean = true
@@ -20,6 +19,7 @@ let pageLogs: Array<{ source: string; message: string }> = []
 let websocketFrames: Array<{ payload: string | Buffer }> = []
 
 const tracePlaywright = process.env.TRACE_PLAYWRIGHT
+let isTracing: boolean = false
 
 // loose global to register teardown functions before quitting the browser instance.
 // This is due to `quit` can be called anytime outside of BrowserInterface's lifecycle,
@@ -46,15 +46,13 @@ interface ElementHandleExt extends ElementHandle {
 }
 
 export class Playwright extends BrowserInterface {
+  private page: Page
   private activeTrace?: string
   private eventCallbacks: Record<Event, Set<(...args: any[]) => void>> = {
     request: new Set(),
   }
-  private async initContextTracing(
-    url: string,
-    page: Page,
-    context: BrowserContext
-  ) {
+
+  private async initContextTracing(url: string, context: BrowserContext) {
     if (!tracePlaywright) {
       return
     }
@@ -63,15 +61,23 @@ export class Playwright extends BrowserInterface {
       // Clean up if any previous traces are still active
       await teardown(this.teardownTracing.bind(this))
 
-      await context.tracing.start({
-        screenshots: true,
-        snapshots: true,
-        sources: true,
+      if (!isTracing) {
+        await context.tracing.start({
+          screenshots: true,
+          snapshots: true,
+          sources: true,
+        })
+        isTracing = true
+      }
+
+      await context.tracing.startChunk({
+        title: expect.getState().currentTestName,
       })
+
       this.activeTrace = encodeURIComponent(url)
 
-      page.on('close', async () => {
-        await teardown(this.teardownTracing.bind(this))
+      context.on('close', () => {
+        isTracing = false
       })
     } catch (e) {
       this.activeTrace = undefined
@@ -79,9 +85,12 @@ export class Playwright extends BrowserInterface {
   }
 
   private async teardownTracing() {
-    if (!tracePlaywright || !this.activeTrace) {
+    if (!this.activeTrace) {
       return
     }
+
+    let trace = this.activeTrace
+    this.activeTrace = undefined
 
     try {
       const traceDir = path.join(__dirname, '../../traces')
@@ -90,17 +99,15 @@ export class Playwright extends BrowserInterface {
         `${path
           .relative(path.join(__dirname, '../../'), process.env.TEST_FILE_PATH)
           .replace(/\//g, '-')}`,
-        `playwright-${this.activeTrace}-${Date.now()}.zip`
+        `playwright-${trace}-${Date.now()}.zip`
       )
 
       await fs.remove(traceOutputPath)
-      await context.tracing.stop({
+      await context.tracing.stopChunk({
         path: traceOutputPath,
       })
     } catch (e) {
       require('console').warn('Failed to teardown playwright tracing', e)
-    } finally {
-      this.activeTrace = undefined
     }
   }
 
@@ -164,7 +171,8 @@ export class Playwright extends BrowserInterface {
   }
 
   async close(): Promise<void> {
-    await page.close()
+    await this.page.close()
+    this.page = undefined
   }
 
   async launchBrowser(browserName: string, launchOptions: Record<string, any>) {
@@ -193,7 +201,7 @@ export class Playwright extends BrowserInterface {
   }
 
   async get(url: string): Promise<void> {
-    await page.goto(url)
+    await this.page.goto(url)
   }
 
   async loadPage(
@@ -206,61 +214,70 @@ export class Playwright extends BrowserInterface {
     }
   ) {
     // clean-up existing pages
-    for (const oldPage of context.pages()) {
-      await oldPage.close()
+    if (this.page) {
+      await this.page.close()
     }
 
-    page = await context.newPage()
-    await this.initContextTracing(url, page, context)
+    // for (const oldPage of context.pages()) {
+    //   await oldPage.close()
+    // }
+
+    await this.initContextTracing(url, context)
+
+    this.page = await context.newPage()
+
+    this.page.on('close', async () => {
+      await teardown(this.teardownTracing.bind(this))
+    })
 
     // in development compilation can take longer due to
     // lower CPU availability in GH actions
-    page.setDefaultTimeout(60 * 1000)
-    page.setDefaultNavigationTimeout(60 * 1000)
+    this.page.setDefaultTimeout(60 * 1000)
+    this.page.setDefaultNavigationTimeout(60 * 1000)
 
     pageLogs = []
     websocketFrames = []
 
-    page.on('console', (msg) => {
+    this.page.on('console', (msg) => {
       console.log('browser log:', msg)
       pageLogs.push({ source: msg.type(), message: msg.text() })
     })
-    page.on('crash', () => {
+    this.page.on('crash', () => {
       console.error('page crashed')
     })
-    page.on('pageerror', (error) => {
+    this.page.on('pageerror', (error) => {
       console.error('page error', error)
 
       if (opts?.pushErrorAsConsoleLog) {
         pageLogs.push({ source: 'error', message: error.message })
       }
     })
-    page.on('request', (req) => {
+    this.page.on('request', (req) => {
       this.eventCallbacks.request.forEach((cb) => cb(req))
     })
 
     if (opts?.disableCache) {
       // TODO: this doesn't seem to work (dev tools does not check the box as expected)
-      const session = await context.newCDPSession(page)
+      const session = await context.newCDPSession(this.page)
       session.send('Network.setCacheDisabled', { cacheDisabled: true })
     }
 
     if (opts?.cpuThrottleRate) {
-      const session = await context.newCDPSession(page)
+      const session = await context.newCDPSession(this.page)
       // https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setCPUThrottlingRate
       session.send('Emulation.setCPUThrottlingRate', {
         rate: opts.cpuThrottleRate,
       })
     }
 
-    page.on('websocket', (ws) => {
+    this.page.on('websocket', (ws) => {
       if (tracePlaywright) {
-        page
+        this.page
           .evaluate(`console.log('connected to ws at ${ws.url()}')`)
           .catch(() => {})
 
         ws.on('close', () =>
-          page
+          this.page
             .evaluate(`console.log('closed websocket ${ws.url()}')`)
             .catch(() => {})
         )
@@ -269,31 +286,31 @@ export class Playwright extends BrowserInterface {
         websocketFrames.push({ payload: frame.payload })
 
         if (tracePlaywright) {
-          page
+          this.page
             .evaluate(`console.log('received ws message ${frame.payload}')`)
             .catch(() => {})
         }
       })
     })
 
-    opts?.beforePageLoad?.(page)
+    opts?.beforePageLoad?.(this.page)
 
-    await page.goto(url, { waitUntil: 'load' })
+    await this.page.goto(url, { waitUntil: 'load' })
   }
 
   back(options): BrowserInterface {
     return this.chain(async () => {
-      await page.goBack(options)
+      await this.page.goBack(options)
     })
   }
   forward(options): BrowserInterface {
     return this.chain(async () => {
-      await page.goForward(options)
+      await this.page.goForward(options)
     })
   }
   refresh(): BrowserInterface {
     return this.chain(async () => {
-      await page.reload()
+      await this.page.reload()
     })
   }
   setDimensions({
@@ -303,14 +320,14 @@ export class Playwright extends BrowserInterface {
     height: number
     width: number
   }): BrowserInterface {
-    return this.chain(() => page.setViewportSize({ width, height }))
+    return this.chain(() => this.page.setViewportSize({ width, height }))
   }
   addCookie(opts: { name: string; value: string }): BrowserInterface {
     return this.chain(async () =>
       context.addCookies([
         {
           path: '/',
-          domain: await page.evaluate('window.location.hostname'),
+          domain: await this.page.evaluate('window.location.hostname'),
           ...opts,
         },
       ])
@@ -320,11 +337,9 @@ export class Playwright extends BrowserInterface {
     return this.chain(async () => context.clearCookies())
   }
 
-  focusPage() {
-    return this.chain(() => page.bringToFront())
-  }
-
   private wrapElement(el: ElementHandle, selector: string): ElementHandleExt {
+    const page = this.page
+
     function getComputedCss(prop: string) {
       return page.evaluate(
         function (args) {
@@ -371,7 +386,7 @@ export class Playwright extends BrowserInterface {
   async getComputedCss(prop: string) {
     return this.chain((el: ElementHandleExt) => {
       return el.getComputedCss(prop)
-    }) as any
+    })
   }
 
   async getAttribute<T = any>(attr) {
@@ -384,13 +399,13 @@ export class Playwright extends BrowserInterface {
 
   keydown(key: string): BrowserInterface {
     return this.chain((el: ElementHandleExt) => {
-      return page.keyboard.down(key).then(() => el)
+      return this.page.keyboard.down(key).then(() => el)
     })
   }
 
   keyup(key: string): BrowserInterface {
     return this.chain((el: ElementHandleExt) => {
-      return page.keyboard.up(key).then(() => el)
+      return this.page.keyboard.up(key).then(() => el)
     })
   }
 
@@ -408,7 +423,7 @@ export class Playwright extends BrowserInterface {
 
   elementsByCss(sel) {
     return this.chain(() =>
-      page.$$(sel).then((els) => {
+      this.page.$$(sel).then((els) => {
         return els.map((el) => {
           const origGetAttribute = el.getAttribute.bind(el)
           el.getAttribute = (name) => {
@@ -424,12 +439,12 @@ export class Playwright extends BrowserInterface {
 
   waitForElementByCss(selector, timeout?: number) {
     return this.chain(() => {
-      return page
+      return this.page
         .waitForSelector(selector, { timeout, state: 'attached' })
         .then(async (el) => {
           // it seems selenium waits longer and tests rely on this behavior
           // so we wait for the load event fire before returning
-          await page.waitForLoadState()
+          await this.page.waitForLoadState()
           return this.wrapElement(el, selector)
         })
     })
@@ -437,20 +452,20 @@ export class Playwright extends BrowserInterface {
 
   waitForCondition(condition, timeout) {
     return this.chain(() => {
-      return page.waitForFunction(condition, { timeout })
+      return this.page.waitForFunction(condition, { timeout })
     })
   }
 
   eval<T = any>(fn: any, ...args: any[]): Promise<T> {
     return this.chainWithReturnValue(() =>
-      page
+      this.page
         .evaluate(fn, ...args)
         .catch((err) => {
           console.error('eval error:', err)
           return null
         })
         .then(async (val) => {
-          await page.waitForLoadState()
+          await this.page.waitForLoadState()
           return val as T
         })
     )
@@ -474,7 +489,7 @@ export class Playwright extends BrowserInterface {
       })()`
     }
 
-    return page.evaluate<T>(fn).catch(() => null)
+    return this.page.evaluate<T>(fn).catch(() => null)
   }
 
   async log() {
@@ -486,12 +501,12 @@ export class Playwright extends BrowserInterface {
   }
 
   async url() {
-    return this.chain(() => page.evaluate('window.location.href')) as any
+    return this.chain(() => this.page.evaluate('window.location.href')) as any
   }
 
   async waitForIdleNetwork(): Promise<void> {
     return this.chain(() => {
-      return page.waitForLoadState('networkidle')
+      return this.page.waitForLoadState('networkidle')
     })
   }
 }
